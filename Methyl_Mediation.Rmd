@@ -1,0 +1,617 @@
+---
+title: "Analysis of DNA methylation's mediation of differential expression"
+author: "Sam Bogan"
+date: "10/11/2022"
+output:
+  github_document: default
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_knit$set(root.dir = '~/Documents/GitHub/Methyl_Mediation/')
+
+```
+
+#Load required packages
+
+```{r, warning = FALSE, message = FALSE}
+
+# Load required packages
+library(edgeR)
+library(tidyverse)
+library(ape)
+library(vegan)
+library(data.table)
+library(plyr)
+library(mediation)
+library(brms)
+
+```
+
+#Read in data, add metadata
+
+```{r}
+
+# Read in csv of read counts per gene
+gene_counts <- read.csv("Input_data/gene_read_counts.csv")
+exon_perc_meth <- read.csv("Input_data/meth_exon_perc_meth.csv")
+int_perc_meth <- read.csv("Input_data/meth_intron_perc_meth.csv")
+pr_perc_meth <- read.csv("Input_data/meth_promoter_perc_meth.csv")
+
+# Remove duplicated transcripts
+n_occur_gc <- data.frame(table(gene_counts$Geneid))
+n_occur_gc <- n_occur_gc[n_occur_gc$Freq > 1, ]
+n_occur_gc <- n_occur_gc$Var1
+
+gene_counts <- gene_counts[!gene_counts$Geneid %in% n_occur_gc,]
+
+#Make gene id matrix rowname
+row.names(gene_counts) <- gene_counts$Geneid
+
+gene_counts <- subset(gene_counts, 
+                      select = -c(Geneid, 
+                                  Chr, 
+                                  Start, 
+                                  End, 
+                                  Strand, 
+                                  Length))
+
+
+# Replace sample IDs with simple names
+colnames( gene_counts ) <- c( "NN1","NN2","NN3","NU1","NU2","NU3",
+                     "UN1","UN2","UN3","UU1","UU2","UU3" )
+
+# Create treatment group df
+Mat = c( "N","N","N","N","N","N",
+         "U","U","U","U","U","U" )
+
+Dev = c( "N","N","N","U","U","U",
+         "N","N","N","U","U","U" )
+
+targets_gc <- data.frame( Mat = c( "N","N","N","N","N","N",
+                                   "U","U","U","U","U","U" ), 
+                          Dev = c( "N","N","N","U","U","U",
+                                   "N","N","N","U","U","U" ) )
+
+ex_meth <- t(exon_perc_meth[-c(1,2)])
+  
+targets_gc$grouping <- paste( targets_gc$Mat, 
+                             targets_gc$Dev,
+                             sep="_" )
+
+# Round counts (if necessary() for use in edgeR
+data_input_gc <- round( gene_counts )
+
+```
+
+#Normalize RNAseq read counts and plot PCOA
+
+```{r}
+
+# Make a DGEList
+DGEList <- DGEList( counts = data_input_gc, 
+                    group = targets_gc$grouping, 
+                    remove.zeros = T )
+
+# Let's remove genes with less then 0.5 cpm (this is ~10 counts in the count file) in no fewer then 9 samples
+DGEList_keep <- rowSums( cpm( DGEList ) > 0.5 ) >= 9
+
+# How many genes are removed by read count filter?
+table( DGEList_keep )
+
+# Filter and set keep.lib.sizes = F to have R recalculate library sizes after filtering
+DGEList <- DGEList[ DGEList_keep, 
+                    keep.lib.sizes = FALSE ]
+
+# Create library size normalization factors
+DGEList <- calcNormFactors( DGEList )
+
+
+# CPM conversion and log^2 transformation of read counts
+DGEList_log <- cpm( DGEList,
+                    log = FALSE, 
+                    prior.count = 2 )
+
+# MDS of normalized gene read counts
+MDS <- plotMDS( DGEList_log )
+
+# Print MDS plot
+MDS
+
+# Run pcoa on gene read counts
+pcoa_gc <- pcoa( vegdist( t( DGEList_log <- cpm ( DGEList, 
+                                                  log = TRUE, 
+                                                  prior.count = 2 ) ), 
+                          method = "euclidean" ) / 1000 )
+
+# Print sample scores across vectors
+head( pcoa_gc$vectors )
+
+
+```
+
+#Wrangle data
+
+Melt matrices of read counts and methylation counts into one tabular, merged data frame. This is required for fitting lm() or glm.nb() models.
+
+```{r, warning = FALSE}
+
+# Write custom code for modelling gene expression as a function of environments, methylation, and environment x methylation covariance
+logCPM_df <- as.data.frame(DGEList_log)
+
+# Create tabularized df containing all replicates using 'melt' function in reshape2
+logCPM_df$geneid <- row.names(logCPM_df)
+
+tab_exp_df <- melt(logCPM_df,
+                   id = c("geneid"))
+
+tab_exp_df$geneid <- gsub("transcript:", "", 
+                          gsub("-tr", "", tab_exp_df$geneid))
+
+tab_exp_df$Mat_treat <- substr(tab_exp_df$variable,1,1)
+tab_exp_df$Dev_treat <- substr(tab_exp_df$variable,2,2)
+
+## Melt and merge exon perc meth data with tab_exp_df
+# For each transcript, average exon CpG methylation per sample
+exon_perc_meth$geneid <- gsub("-tr.*", "", exon_perc_meth$V41)
+int_perc_meth$geneid <- gsub("transcript:", "", 
+                          gsub("-tr.*", "", int_perc_meth$V41))
+
+all_gw_p_meth <- rbind(exon_perc_meth,
+                       int_perc_meth)
+
+all_gw_p_meth <- aggregate(all_gw_p_meth[c(2:14)], list(all_gw_p_meth$geneid), FUN = mean) 
+
+
+all_gw_meth <- melt(all_gw_p_meth[-c(2)],
+                   id = c("Group.1"))
+
+all_gw_meth$Group.1 <- gsub("transcript:", "", all_gw_meth$Group.1)
+
+names(all_gw_meth)[names(all_gw_meth) == 'value'] <- 'all_gw_meth'
+
+all_gw_meth$sample_gene <- paste(all_gw_meth$variable,
+                                  all_gw_meth$Group.1,
+                                  sep = "_")
+tab_exp_df$sample_gene <- paste(tab_exp_df$variable,
+                                  tab_exp_df$geneid,
+                                  sep = "_")
+
+# Merge logCPM and exon methylation datasets
+
+tab_exp_df3 <- merge(tab_exp_df,
+                     all_gw_meth[-c(2)],
+                    by = "sample_gene")
+
+# Take a peak at how tab_exp_df3 is formatted since this is the input data frame for structural models
+head(tab_exp_df3)
+
+```
+
+#Fit structural equation models to transcripts
+
+```{r}
+
+# Fit SEM models
+lm1s <- dlply(tab_exp_df3, c("geneid"), function(df) 
+lm(all_gw_meth ~ Mat_treat + Dev_treat, data = df))
+
+lm2s <- dlply(tab_exp_df3, c("geneid"), function(df) 
+lm(value ~ Mat_treat + Dev_treat + all_gw_meth, data = df))
+
+## If dev treat contains NA coefficient, remove from lm1 and lm2
+# First, convert lm's to coefficient df's
+lm1_coefs <- list() 
+
+for (i in 1:length(lm1s)) {
+ lm1_coefs[[i]] <- as.data.frame(lm1s[[i]]$effects)[2,1]
+}
+names(lm1_coefs) <- names(lm1s)
+
+lm2_coefs <- list() 
+
+for (i in 1:length(lm2s)) {
+ lm2_coefs[[i]] <- as.data.frame(lm2s[[i]]$effects)
+}
+names(lm2_coefs) <- names(lm2s)
+
+lm1_pvals <- list() 
+
+# Report significant DM exons
+
+for (i in 1:length(lm1s)) {
+ lm1_pvals[[i]] <- as.data.frame(anova(lm1s[[i]]))[1,5]
+}
+names(lm1_pvals) <- names(lm1s)
+
+```
+
+#Mediation analysis
+
+```{r, eval = FALSE}
+
+# Mediation of maternal DE effect by DM
+mat_mediations <- list() # Create list to add vcov results to
+
+for (i in 1:length(lm1s)) {
+ tryCatch({mat_mediations[[i]] <- summary(mediate(lm1s[[i]], lm2s[[i]], sims = 1000, treat = "Mat_treat", mediator = "all_gw_meth"))
+ }, error=function(e){})
+}
+names(mat_mediations) <- names(lm1s)
+
+save(mat_mediations, file = "mat_mediations.RData")
+
+```
+
+##Report significant mediated effects
+
+```{r, echo = FALSE, include = FALSE}
+
+load("mat_mediations.RData")
+
+```
+
+```{r}
+
+# Extract p-values for indirect effects: E -> M -> GE
+ind_p_m <- list() 
+
+for (i in 1:length(mat_mediations)) {
+ ind_p_m[[i]] <- mat_mediations[[i]]$d0.p 
+}
+names(ind_p_m) <- names(mat_mediations)
+
+# Extract indirect effect confidence intervals
+ind_ci_m <- list() 
+
+for (i in 1:length(mat_mediations)) {
+ ind_ci_m[[i]] <- data.frame(t(as.data.frame(mat_mediations[[i]]$d0.ci)))
+}
+names(ind_ci_m) <- names(mat_mediations)
+
+ind_p_vm <- list() 
+
+# Create df with geneid and indirect effect pvals
+for (i in 1:length(ind_p_m)) {
+ new_value_m <- as.numeric(ind_p_m[[i]])
+ ind_p_vm <- c(ind_p_vm, new_value_m)
+}
+
+ind_ci_m_df <- bind_rows(ind_ci_m, .id = "column_label")
+
+ind_ci_vm <- list() 
+
+# Create df with geneid and indirect effect pvals
+ind_p_dfm <- as.data.frame(t(data.frame(ind_p_vm)))
+
+ind_p_dfm$fdr <- p.adjust(ind_p_dfm$V1, method = "fdr")
+
+nrow(filter(ind_p_dfm, fdr < 0.05)) # 21 genes
+ 
+# Filter to include only transcripts with significant mediation parameter estimate
+sig_dev_meth_dfm <- filter(ind_ci_m_df, X2.5. > 0 & X97.5. > 0 | X2.5. < 0 & X97.5. < 0) # 66 mat indirect genes
+nrow(sig_dev_meth_dfm)
+```
+
+##Export parameters from mediation analysis
+
+```{r}
+
+# Extract mediation effect
+prop_m <- list() 
+
+for (i in 1:length(mat_mediations)) {
+ prop_m[[i]] <- mat_mediations[[i]]$n1 
+}
+names(prop_m) <- names(mat_mediations)
+
+prop_m_df <- as.data.frame(t(bind_rows(prop_m, .id = "column_label")))
+prop_m_df$geneid <- rownames(prop_m_df)
+
+d0_m <- list() 
+
+for (i in 1:length(mat_mediations)) {
+ d0_m[[i]] <- mat_mediations[[i]]$d0 
+}
+
+names(d0_m) <- names(mat_mediations)
+
+d0_m_df <- as.data.frame(t(bind_rows(d0_m, .id = "column_label")))
+d0_m_df$geneid <- rownames(d0_m_df)
+
+int_params_df <- merge(d0_m_df, prop_m_df, by = "geneid")
+
+names(ind_ci_m_df)[names(ind_ci_m_df) == "column_label"] <- "geneid"
+
+int_params_df <- merge(int_params_df,
+                       ind_ci_m_df,
+                       by = "geneid")
+
+# Extract proportion mediated and ci's and merge with parameter df
+pr_ci_m <- list() 
+
+for (i in 1:length(mat_mediations)) {
+ pr_ci_m[[i]] <- data.frame(t(as.data.frame(mat_mediations[[i]]$n1.ci)))
+}
+names(pr_ci_m) <- names(mat_mediations)
+
+pr_ci_m_df <- bind_rows(pr_ci_m, .id = "column_label")
+names(pr_ci_m_df)[names(pr_ci_m_df) == "column_label"] <- "geneid"
+
+int_params_df <- merge(int_params_df,
+                       pr_ci_m_df,
+                       by = "geneid")
+
+```
+
+#Filter mediation genes according to likelihood of causal direction
+
+```{r, eval = FALSE}
+
+# Run line below to prevent RStan from producing a message asking you to install RTools
+options(buildtools.check = function(action) TRUE )
+
+## Filter genes based on likelihood of causal direction using looped brms models and bayes_factor tests
+tab_exp_df3_filt <- filter(tab_exp_df3, geneid %in% sig_dev_meth_dfm$column_label)
+
+# Fit 'triangle' models
+triangle_brms <- dlply(tab_exp_df3_filt, c("geneid"), function(df) 
+brm(bf(value ~ Mat_treat + Dev_treat + all_gw_meth) +
+                      bf(all_gw_meth ~ Mat_treat + Dev_treat) +
+                      set_rescor(FALSE),
+         data = df, 
+         family = gaussian(),
+         iter = 20000,
+         save_mevars = TRUE,
+         save_pars = save_pars(all = TRUE)))
+
+save(triangle_brms, file = "triangle_brms.RData")
+
+# Fit 'straight line' models
+straight_brms <- dlply(tab_exp_df3_filt, c("geneid"), function(df) 
+  brm(bf(value ~ Mat_treat + Dev_treat) +
+                    bf(all_gw_meth ~ value) +
+                    set_rescor(FALSE),
+         data = df,
+         family = gaussian(),
+         iter = 20000,
+         save_mevars = TRUE,
+         save_pars = save_pars(all = TRUE)))
+
+save(straight_brms, file = "straight_brms.RData")
+
+```
+
+```{r, echo = FALSE, include = FALSE}
+
+# Load brms RData objects
+load("triangle_brms.RData")
+load("straight_brms.RData") 
+
+```
+
+```{r, eval = FALSE}
+
+# Apply Bayes factor tests with for loop
+bf_list <- list() 
+
+for (i in 1:length(triangle_brms)) {
+ bf_list[[i]] <- bayes_factor(triangle_brms[[i]], straight_brms[[i]]) 
+}
+names(bf_list) <- names(triangle_brms)
+
+save(bf_list, file = "bf_list.RData")
+
+```
+
+```{r}
+
+load("bf_list.RData")
+
+# Extract bf values
+bf_vals <- list() 
+
+for (i in 1:length(bf_list)) {
+ bf_vals[[i]] <- as.data.frame(bf_list[[i]]$bf)
+}
+
+names(bf_vals) <- names(bf_list)
+
+# Convert list of bf's to df
+bf_vals_df <- bind_rows(bf_vals, .id = "column_label")
+
+# Count and summarize genes with support for 
+mean(bf_vals_df$`bf_list[[i]]$bf`) # 186.7349
+sd(bf_vals_df$`bf_list[[i]]$bf`) # 512.1488
+
+filt_bf <- filter(bf_vals_df, `bf_list[[i]]$bf` > 1)
+nrow(filt_bf) # 51 or 77.27%
+
+```
+
+#Plot and export figures
+
+```{r}
+
+## Volcano plot of DM across gene bodies predicted by structural model
+lm1_coefs_df <- as.data.frame(t(bind_rows(lm1_coefs, .id = "column_label")))
+lm1_coefs_df$geneid <- rownames(lm1_coefs_df) 
+lm1_pvals_df <- as.data.frame(t(bind_rows(lm1_pvals, .id = "column_label")))
+lm1_pvals_df$geneid <- rownames(lm1_pvals_df) 
+
+lm1_p_coef_df <- merge(lm1_coefs_df,
+                       lm1_pvals_df,
+                       by = "geneid")
+
+lm1_p_coef_df$fdr <- p.adjust(lm1_p_coef_df$V1.y, method = "fdr")
+
+# Plot volcano plot of maternal sig DM gene bodies
+lm1_p_coef_df$sig <- ifelse(lm1_p_coef_df$fdr < 0.05, "Yes", "No")
+count(lm1_p_coef_df$sig)
+
+mat_meth_volcano <- ggplot(data = lm1_p_coef_df,
+                           aes(x = V1.x, y = -log(V1.y), 
+                               color = sig, size = sig)) +
+  geom_point() +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_size_manual(values = c(1.5, 3)) +
+  scale_y_continuous(limits = c(0 , 17)) +
+  scale_x_continuous(limits = c(-55, 55)) +
+  labs(x = "Differential methylation (slope)", y = "-log(p-value)")
+ 
+# Export volcano plot
+png( "med_meth_volcano.png", units = "in", width = 7, 
+      height = 7, 
+      res = 600 )
+
+mat_meth_volcano
+
+dev.off()
+
+mat_meth_volcano
+
+# Plot volcano of dev sig DM
+lm1_coef_d <- list() 
+
+for (i in 1:length(lm1s)) {
+ lm1_coef_d[[i]] <- as.data.frame(lm1s[[i]]$effects)[3,1]
+}
+names(lm1_coef_d) <- names(lm1s)
+
+lm1_pval_d <- list() 
+
+# Report significant DM gene bodies
+
+for (i in 1:length(lm1s)) {
+ lm1_pval_d[[i]] <- as.data.frame(anova(lm1s[[i]]))[2,5]
+}
+names(lm1_pval_d) <- names(lm1s)
+
+as.data.frame(anova(lm2s[[1]]))[2,5]
+
+lm1_coef_d_df <- as.data.frame(t(bind_rows(lm1_coef_d, .id = "column_label")))
+lm1_coef_d_df$geneid <- rownames(lm1_coef_d_df) 
+lm1_pval_d_df <- as.data.frame(t(bind_rows(lm1_pval_d, .id = "column_label")))
+lm1_pval_d_df$geneid <- rownames(lm1_pval_d_df) 
+
+lm1_p_coef_d_df <- merge(lm1_coef_d_df,
+                       lm1_pval_d_df,
+                       by = "geneid")
+
+lm1_p_coef_d_df$fdr <- p.adjust(lm1_p_coef_d_df$V1.y, method = "fdr")
+
+# Plot volcano plot of dev sig DM gene bodies
+lm1_p_coef_d_df$sig <- ifelse(lm1_p_coef_d_df$fdr < 0.05, "Yes", "No")
+count(lm1_p_coef_d_df$sig)
+
+dev_meth_volcano <- ggplot(data = lm1_p_coef_d_df,
+                           aes(x = V1.x, y = -log(V1.y), 
+                               color = sig, size = sig)) +
+  geom_point() +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_size_manual(values = c(1.5, 3)) +
+  scale_y_continuous(limits = c(0 , 17)) +
+  scale_x_continuous(limits = c(-55, 55)) +
+  labs(x = "Differential methylation (slope)", y = "-log(p-value)")
+ 
+# Export bf_dens plot
+png( "dev_meth_volcano.png", units = "in", width = 7, 
+      height = 7, 
+      res = 600 )
+
+dev_meth_volcano
+
+dev.off()
+
+dev_meth_volcano
+
+```
+
+```{r}
+
+# Plot distribution of bf's
+bf_dens <- ggplot(data = bf_vals_df,
+       aes(x = log(`bf_list[[i]]$bf`))) +
+  geom_density(size = 1, fill = "grey") +
+  theme_classic(base_size = 20) +
+  geom_vline(xintercept = log(1), lty = 2, size = 1, color = "black") +
+  labs( x = "log(Bayes factor)", y = "Density")
+
+# Export bf_dens plot
+png( "bf_dens_plot.png", units = "in", width = 7, 
+      height = 7, 
+      res = 600 )
+
+bf_dens
+
+dev.off()
+
+bf_dens
+
+```
+
+```{r}
+
+# 62% of mediated effects are in genes with positive correlations between expression and methylation
+med_genes_plot <- ggplot(data = filter(tab_exp_df3, Group.1 %in% sig_dev_meth_dfm$column_label &
+                       Group.1 %in% filt_bf$column_label),
+       aes(y = value, x = all_gw_meth)) +
+  geom_point(aes(color = Mat_treat)) +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_classic(base_size = 20) +
+  facet_wrap(~Group.1, scale = "free", nrow = 5) +
+  theme(strip.text = element_blank(),
+        strip.background = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = "none") +
+  labs(y = "CPM", x = "% GBM", color = "Maternal treatment")
+
+# Export bf_dens plot
+png( "med_genes_plot.png", units = "in", width = 12, 
+      height = 7, 
+      res = 600 )
+
+med_genes_plot
+
+dev.off()
+
+med_genes_plot
+
+```
+
+```{r}
+
+# Plot mediated effects against their proportion of total mediated
+int_params_df$color <- ifelse(int_params_df$geneid %in% filt_bf$column_label, "Red", "Black")
+
+med_effect_plot <- 
+  ggplot(data = filter(int_params_df, geneid %in% sig_dev_meth_dfm$column),
+       aes(y = abs(V1.y), x = V1.x)) +
+  #geom_errorbar(aes(xmin = X2.5..x, xmax = X97.5..x), width = 0, color = "lightgrey") +
+  geom_point(aes(color = color, size = color)) +
+  geom_smooth(method = "lm", se = TRUE, formula = y~poly(x,2), fill = "skyblue", alpha = 0.25) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("Black", "Red")) +
+  scale_size_manual(values = c(1.5, 3)) +
+  labs(y = "Proportion mediated", x = "Maternal mediation effect")
+
+# Export med_effect_plot
+png( "med_effect_plot.png", units = "in", width = 7, 
+      height = 7, 
+      res = 600 )
+
+med_effect_plot
+
+dev.off()
+
+med_effect_plot
+
+```
