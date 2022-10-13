@@ -1,10 +1,9 @@
 ---
 title: "Analysis of DNA methylation's mediation of differential expression"
-author: "Sam Bogan"
-date: "10/11/2022"
+author: "Samuel Bogan"
 output:
-  github_document: default
   pdf_document: default
+  github_document: default
   html_document: default
 ---
 
@@ -34,7 +33,7 @@ library(brms)
 
 ```{r}
 
-# Read in csv of read counts per gene
+# Read in csv of read counts per gene, CpG methylation counts per feature type
 gene_counts <- read.csv("Input_data/gene_read_counts.csv")
 exon_perc_meth <- read.csv("Input_data/meth_exon_perc_meth.csv")
 int_perc_meth <- read.csv("Input_data/meth_intron_perc_meth.csv")
@@ -303,7 +302,7 @@ nrow(sig_dev_meth_dfm)
 prop_m <- list() 
 
 for (i in 1:length(mat_mediations)) {
- prop_m[[i]] <- mat_mediations[[i]]$n1 
+ prop_m[[i]] <- mat_mediations[[i]]$n0 
 }
 names(prop_m) <- names(mat_mediations)
 
@@ -333,7 +332,7 @@ int_params_df <- merge(int_params_df,
 pr_ci_m <- list() 
 
 for (i in 1:length(mat_mediations)) {
- pr_ci_m[[i]] <- data.frame(t(as.data.frame(mat_mediations[[i]]$n1.ci)))
+ pr_ci_m[[i]] <- data.frame(t(as.data.frame(mat_mediations[[i]]$n0.ci)))
 }
 names(pr_ci_m) <- names(mat_mediations)
 
